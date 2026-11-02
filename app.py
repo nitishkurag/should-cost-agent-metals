@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
+import requests
 
 # ------------------------------------------------------------------
 # CONFIG
@@ -320,6 +321,10 @@ SHOULD_COST_SCHEMA = {
         "rm_currency": {"type": "string"},
         "rm_unit_basis": {"type": "string"},
         "rm_source": {"type": "string"},
+        "rm_price_source_date": {
+            "type": "string",
+            "description": "Date the raw material price is as of, in YYYY-MM-DD or YYYY-MM format. Use your best knowledge; if uncertain, use '2024-06'."
+        },
         "processes": {
             "type": "array",
             "items": {
@@ -366,7 +371,7 @@ SHOULD_COST_SCHEMA = {
         "labor_source", "electricity_rate_usd_per_kwh", "electricity_source",
         "overhead_pct", "overhead_source", "logistics_freight_usd_per_kg",
         "logistics_packaging_usd", "logistics_source", "margin_pct",
-        "margin_source", "forecast_drivers",
+        "margin_source", "forecast_drivers", "rm_price_source_date",
     ],
 }
 
@@ -480,6 +485,30 @@ def validate_llm_rates(data: dict) -> None:
         raise ValueError(f"Labor rate out of band: {data['labor_rate_usd_hr']}")
 
 
+from datetime import datetime, timedelta
+
+def parse_price_date(date_str: str) -> datetime | None:
+    """Parse LLM-returned date string. Returns None if unparseable."""
+    if not date_str:
+        return None
+    s = date_str.strip().replace("/", "-")
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    m = re.search(r"(20\d{2})", s)
+    if m:
+        return datetime(int(m.group(1)), 6, 1)
+    return None
+
+
+def is_stale(price_date: datetime | None, max_age_days: int = 90) -> bool:
+    """True if price_date is None or older than max_age_days."""
+    if price_date is None:
+        return True
+    return (datetime.now() - price_date).days > max_age_days
+
 def assemble_model_from_llm(data: dict, g: dict) -> dict:
     """Reuse your existing lever structure so downstream panes stay unchanged."""
     weight = float(g.get("weight_kg", 1.20))
@@ -564,41 +593,144 @@ def assemble_model_from_llm(data: dict, g: dict) -> dict:
         "source_mode": "LLM (Groq gpt-oss-120b)",
     }
 
+def search_price_change_pct(material_grade: str, source_date: datetime) -> tuple[float | None, str]:
+    """
+    Search for the % change in material price from source_date to now.
+    Returns (pct_as_decimal, raw_snippet) or (None, error_message).
+    """
+    g = material_grade.lower()
+    if "stainless" in g:
+        label = "stainless steel"
+    elif "alumin" in g:
+        label = "aluminum"
+    else:
+        label = "steel"
+
+    date_str = source_date.strftime("%B %Y")
+    # More targeted query: ask specifically for the % change between two periods
+    query = (
+        f"\"{label}\" price \"percent change\" OR \"% change\" "
+        f"from {date_str} to 2026 site:worldbank.org OR site:steelmarketupdate.com"
+    )
+
+    api_key = st.secrets.get("TAVILY_API_KEY", "").strip()
+    if not api_key:
+        return None, "TAVILY_API_KEY not configured in secrets"
+
+    try:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "query": query,
+                "search_depth": "advanced",   # advanced gives better snippets
+                "max_results": 5,
+                "include_answer": True,
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        answer = (data.get("answer") or "").strip()
+        snippets = " ".join(
+            (item.get("content") or "") for item in (data.get("results") or [])
+        )
+        combined = (answer + " " + snippets).lower()
+
+        # Require BOTH a percentage AND a time reference matching our query window
+        # Time window keywords: "since {date}", "from {date}", "compared to {date}"
+        date_tokens = [source_date.strftime("%B %Y").lower(), source_date.strftime("%Y").lower()]
+        has_time_ref = any(tok in combined for tok in date_tokens)
+
+        if not has_time_ref:
+            return None, f"no time reference matching {date_str} in search results"
+
+        patterns = [
+            # "steel prices rose 25% from June 2024 to..."
+            r"(?:steel|aluminum|stainless)[^.]{0,80}?(?:rose|increased|up|gained)[^.]{0,40}?(\d+(?:\.\d+)?)\s*%",
+            # "a 25% increase in steel prices since..."
+            r"(\d+(?:\.\d+)?)\s*%\s*(?:increase|rise|gain)[^.]{0,60}?(?:steel|aluminum|stainless)",
+            # "prices are 25% higher than..."
+            r"(?:steel|aluminum|stainless)[^.]{0,60}?(?:are|is)\s*(\d+(?:\.\d+)?)\s*%\s*higher",
+        ]
+        for pat in patterns:
+            m = re.search(pat, combined, re.IGNORECASE | re.DOTALL)
+            if m:
+                pct = float(m.group(1)) / 100.0
+                if 0.0 < pct < 1.0:  # sanity: < 100% change
+                    return pct, (answer or combined[:400])
+
+        return None, f"no reliable percentage found. Snippet: {combined[:400]}"
+    except Exception as e:
+        return None, f"search error: {str(e)[:200]}"
+
 def build_should_cost(g: dict) -> dict:
-    """Two-step: (1) browser search for live price, (2) structured should-cost."""
     part_name = g.get("part_name", "")
     part_description = st.session_state.get("raw_text", "")
-    price_ref = ""
-    # SKIP browser search if we recently hit a 429
-    if not st.session_state.get("groq_rate_limited"):
-        # Step 1: try to fetch a live price reference (non-fatal if it fails)
-        try:
-            with st.spinner("Searching for current market price…"):
-                price_ref = call_groq_price_search(g["material"], g["region"])
-            st.session_state["price_search_result"] = price_ref
-        except Exception as e:
-            short = str(e).split("\n")[0][:160]
-            if "429" in str(e) or "rate_limit" in str(e).lower():
-                st.session_state["groq_rate_limited"] = True
-            st.session_state["price_search_error"] = short
-            # proceed without price reference; the structured call will use LLM's own estimate
 
-    # Step 2: structured should-cost, with price reference if available
+    # Step 1: Call LLM (no price reference, no search)
     try:
         data = call_groq_should_cost(
             part_description, part_name, g["region"], g["material"],
-            price_reference=price_ref,
+            price_reference="",
         )
         validate_llm_rates(data)
-        st.session_state["llm_error"] = None
-        model = assemble_model_from_llm(data, g)
-        model["source_mode"] = "LLM (Groq gpt-oss-120b)"
-        return model
     except Exception as e:
         st.session_state["llm_error"] = f"{type(e).__name__}: {str(e)[:300]}"
         model = compute_should_cost_from_kb(g)
-        model["source_mode"] = "KB fallback"
+        model["source_mode"] = "KB fallback (LLM unavailable)"
+        st.session_state["price_adjustment"] = None
         return model
+
+    # Step 2: Check price source date. If >90 days, use KB directly.
+    src_date_str = data.get("rm_price_source_date", "")
+    src_date = parse_price_date(src_date_str)
+    stale = is_stale(src_date)
+
+    if stale:
+        try:
+            kb_rm = get_rm_row(g["material"], g["region"])
+            kb_price = kb_rm["price_usd_per_kg"]
+            llm_price = data["rm_price_usd_per_kg"]
+
+            st.session_state["price_adjustment"] = {
+                "reason": "LLM price source date is older than 90 days",
+                "llm_price": llm_price,
+                "llm_date": src_date_str or "unknown",
+                "kb_price": kb_price,
+                "kb_source": kb_rm["source"],
+                "kb_effective": kb_rm["effective_date"],
+            }
+
+            # Overwrite LLM data with KB values so assemble_model_from_llm uses them
+            data["rm_price_usd_per_kg"] = kb_price
+            data["rm_source"] = f"KB benchmark ({kb_rm['source']}, eff. {kb_rm['effective_date']})"
+            data["rm_currency"] = "USD"
+            data["rm_unit_basis"] = "USD/kg"
+            data["rm_price_source_date"] = kb_rm["effective_date"]
+
+        except Exception:
+            # If KB lookup fails, fall back to KB-computed model directly
+            model = compute_should_cost_from_kb(g)
+            model["source_mode"] = "KB fallback (LLM price stale, KB lookup failed)"
+            st.session_state["price_adjustment"] = {
+                "reason": "LLM price stale and KB lookup failed",
+            }
+            st.session_state["llm_error"] = None
+            return model
+    else:
+        st.session_state["price_adjustment"] = None
+
+    st.session_state["llm_error"] = None
+    model = assemble_model_from_llm(data, g)
+    model["source_mode"] = "LLM (Groq gpt-oss-120b)"
+    if stale:
+        model["source_mode"] += " + KB price override (LLM date stale)"
+    return model
 
 # ------------------------------------------------------------------
 # FORECAST — 5 measurable drivers with real index growth + weights exposed
@@ -1154,6 +1286,24 @@ if pane == "Input Pane":
         if price_ref:
             with st.expander("Live price reference used (from browser search)", expanded=False):
                 st.caption(price_ref)
+
+        adj = st.session_state.get("price_adjustment")
+        if adj:
+            with st.expander("ℹ️ Raw material price source", expanded=False):
+                if "error" in adj:
+                    st.caption(adj["error"])
+                elif "reason" in adj:
+                    st.caption(
+                        f"{adj['reason']}. "
+                        f"LLM returned **${adj['llm_price']:.2f}/kg** (as of {adj['llm_date']}), "
+                        f"which is stale. Using KB benchmark **${adj['kb_price']:.2f}/kg** "
+                        f"from *{adj['kb_source']}* (effective {adj['kb_effective']})."
+                    )
+                else:
+                    st.caption(
+                        f"Adjusted from **${adj['original']:.2f}/kg** to "
+                        f"**${adj['adjusted']:.2f}/kg** ({adj['pct']:+.1%})."
+                    )
 
         price_err = st.session_state.get("price_search_error")
         if price_err:
